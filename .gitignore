@@ -1,0 +1,101 @@
+-- Step 1: Extract session start data
+WITH session_data AS (
+  SELECT 
+    -- Extract event date from event timestamp
+    DATE(TIMESTAMP_MICROS(event_timestamp)) AS event_date,
+    -- Use either user_pseudo_id or user_id as the unique user identifier
+    COALESCE(user_pseudo_id, user_id) AS user_id,
+    -- Extract session ID from event parameters
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    -- Extract the page path (without domain or query parameters) from page_location parameter
+    REGEXP_EXTRACT(
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'),
+      r'^https?://[^/]+(/[^?]*)'
+    ) AS page_location_start
+  FROM 
+     -- Access the BigQuery public dataset for GA4 sample eCommerce events
+     `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE 
+    -- Filter for session_start events within the specified date range
+    event_name = 'session_start'
+    AND DATE(TIMESTAMP_MICROS(event_timestamp)) BETWEEN '2020-01-01' AND '2020-12-31'
+),
+
+-- Step 2: Extract page view data
+page_view_data AS (
+  SELECT 
+    -- Use either user_pseudo_id or user_id as the unique user identifier
+    COALESCE(user_pseudo_id, user_id) AS user_id,
+    -- Extract session ID from event parameters
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    -- Extract the page path (without domain or query parameters) from page_location parameter
+    REGEXP_EXTRACT(
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'),
+      r'^https?://[^/]+(/[^?]*)'
+    ) AS page_location_view
+  FROM 
+     -- Access the BigQuery public dataset for GA4 sample eCommerce events
+     `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE 
+    -- Filter for page_view events within the specified date range
+    event_name = 'page_view'
+    AND DATE(TIMESTAMP_MICROS(event_timestamp)) BETWEEN '2020-01-01' AND '2020-12-31'
+),
+
+-- Step 3: Extract purchase data
+purchase_data AS (
+  SELECT 
+    -- Use either user_pseudo_id or user_id as the unique user identifier
+    COALESCE(user_pseudo_id, user_id) AS user_id,
+    -- Extract session ID from event parameters
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id
+  FROM 
+     -- Access the BigQuery public dataset for GA4 sample eCommerce events
+     `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE 
+    -- Filter for purchase events within the specified date range
+    event_name = 'purchase'
+    AND DATE(TIMESTAMP_MICROS(event_timestamp)) BETWEEN '2020-01-01' AND '2020-12-31'
+),
+
+-- Step 4: Merge session, page view, and purchase data
+merged_data AS (
+  SELECT 
+    -- Include user ID and session ID for joining data
+    s.user_id,
+    s.session_id,
+    -- Combine page path from session start and page view data, prioritizing session start
+    COALESCE(s.page_location_start, pv.page_location_view) AS page_path,
+    -- Identify if a purchase occurred during the session
+    p.session_id IS NOT NULL AS is_purchase 
+  FROM 
+    session_data s
+  -- Left join with page view data to match by user ID and session ID
+  LEFT JOIN 
+    page_view_data pv
+  ON 
+    s.user_id = pv.user_id AND s.session_id = pv.session_id
+  -- Left join with purchase data to match by user ID and session ID
+  LEFT JOIN 
+    purchase_data p
+  ON 
+    s.user_id = p.user_id AND s.session_id = p.session_id
+)
+
+-- Step 5: Aggregate and calculate metrics
+SELECT 
+  -- Group by page path
+  page_path,
+  -- Count unique sessions for each page path
+  COUNT(DISTINCT session_id) AS unique_sessions,
+  -- Count the number of purchases for each page path
+  COUNTIF(is_purchase) AS purchases, 
+  -- Calculate conversion rate as the ratio of purchases to unique sessions
+  SAFE_DIVIDE(COUNTIF(is_purchase), COUNT(DISTINCT session_id)) AS conversion_rate 
+FROM 
+  merged_data
+GROUP BY 
+  page_path
+-- Order by conversion rate in descending order to identify the most effective pages
+ORDER BY 
+  conversion_rate DESC;
